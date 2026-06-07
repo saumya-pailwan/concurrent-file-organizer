@@ -42,7 +42,7 @@ java -jar target/concurrent-file-system-organizer-1.0.0.jar <directory> [REPORT|
 java -jar target/concurrent-file-system-organizer-1.0.0.jar ~/demo REPORT
 ```
 
-![Sample run](docs/screenshot.png)
+![Sample run](docs/demo-screenshot.png)
 
 ## Run tests
 
