@@ -7,42 +7,48 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.util.ArrayList;
 import java.util.HexFormat;
-import java.util.List;
 
-// Hashes a file in fixed-size chunks (Rabin-Karp) and computes a full SHA-256 for collision-free verification.
+// Two hashes of increasing cost: a cheap Rabin-Karp hash over the first few KB,
+// and a full SHA-256 that confirms a match.
 public class RollingHasher {
 
     private static final long BASE = 31L;
     private static final long MOD = 1_000_000_007L;
 
-    private final int windowSize;
+    private final int partialBytes;
 
-    public RollingHasher(int windowSize) {
-        this.windowSize = windowSize;
+    public RollingHasher(int partialBytes) {
+        this.partialBytes = partialBytes;
     }
 
-    /** Returns chunk hashes + SHA-256. Empty chunk list means the file was empty. */
-    public HashResult hash(Path file) throws IOException {
-        List<Long> chunkHashes = new ArrayList<>();
+    /**
+     * Rabin-Karp hash of the first partialBytes bytes. Cheap filter: identical files
+     * always share this hash, so a mismatch rules out a duplicate after one short read.
+     */
+    public long partialHash(Path file) throws IOException {
+        byte[] window = new byte[partialBytes];
+        try (InputStream in = Files.newInputStream(file)) {
+            int bytesRead = readFully(in, window);
+            return computeHash(window, bytesRead);
+        }
+    }
+
+    /** SHA-256 of the whole file as lowercase hex. Confirms a duplicate beyond collision doubt. */
+    public String fullHash(Path file) throws IOException {
         MessageDigest sha256 = newSha256();
+        byte[] buffer = new byte[partialBytes];
 
         try (InputStream raw = Files.newInputStream(file);
-             BufferedInputStream in = new BufferedInputStream(raw, windowSize * 2)) {
+             BufferedInputStream in = new BufferedInputStream(raw, partialBytes * 2)) {
 
-            byte[] window = new byte[windowSize];
             int bytesRead;
-
-            while ((bytesRead = readFully(in, window)) > 0) {
-                long chunkHash = computeHash(window, bytesRead);
-                chunkHashes.add(chunkHash);
-                sha256.update(window, 0, bytesRead);
+            while ((bytesRead = readFully(in, buffer)) > 0) {
+                sha256.update(buffer, 0, bytesRead);
             }
         }
 
-        String digest = HexFormat.of().formatHex(sha256.digest());
-        return new HashResult(chunkHashes, digest);
+        return HexFormat.of().formatHex(sha256.digest());
     }
 
     private long computeHash(byte[] data, int length) {
@@ -69,18 +75,6 @@ public class RollingHasher {
             return MessageDigest.getInstance("SHA-256");
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException("SHA-256 not available", e);
-        }
-    }
-
-    public record HashResult(List<Long> chunkHashes, String sha256) {
-        /** Two files are duplicate candidates if their chunk-hash sequences match. */
-        public boolean candidateMatchesWith(HashResult other) {
-            return this.chunkHashes.equals(other.chunkHashes);
-        }
-
-        /** True duplicates share the same SHA-256. */
-        public boolean confirmedMatchesWith(HashResult other) {
-            return this.sha256.equals(other.sha256);
         }
     }
 }

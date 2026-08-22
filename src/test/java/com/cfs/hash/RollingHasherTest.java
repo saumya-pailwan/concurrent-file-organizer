@@ -11,61 +11,97 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class RollingHasherTest {
 
-    private final RollingHasher hasher = new RollingHasher(4096);
+    private static final int PARTIAL_BYTES = 4096;
+
+    private final RollingHasher hasher = new RollingHasher(PARTIAL_BYTES);
 
     @Test
-    void sameContentProducesSameHash(@TempDir Path tmp) throws IOException {
+    void identicalFilesShareBothHashes(@TempDir Path tmp) throws IOException {
         byte[] data = "hello world, this is a test".getBytes();
-        Path a = tmp.resolve("a.txt");
-        Path b = tmp.resolve("b.txt");
-        Files.write(a, data);
-        Files.write(b, data);
+        Path a = write(tmp, "a.txt", data);
+        Path b = write(tmp, "b.txt", data);
 
-        RollingHasher.HashResult ra = hasher.hash(a);
-        RollingHasher.HashResult rb = hasher.hash(b);
-
-        assertEquals(ra.chunkHashes(), rb.chunkHashes(), "chunk hashes must match for identical content");
-        assertEquals(ra.sha256(), rb.sha256(), "SHA-256 must match for identical content");
-        assertTrue(ra.candidateMatchesWith(rb));
-        assertTrue(ra.confirmedMatchesWith(rb));
+        assertEquals(hasher.partialHash(a), hasher.partialHash(b));
+        assertEquals(hasher.fullHash(a), hasher.fullHash(b));
     }
 
     @Test
-    void oneByteDifferenceProducesDifferentHash(@TempDir Path tmp) throws IOException {
-        byte[] data1 = "hello world".getBytes();
-        byte[] data2 = "hello World".getBytes(); // capital W
+    void oneByteDifferenceChangesBothHashes(@TempDir Path tmp) throws IOException {
+        Path a = write(tmp, "a.txt", "hello world".getBytes());
+        Path b = write(tmp, "b.txt", "hello World".getBytes()); // capital W
 
-        Path a = tmp.resolve("a.txt");
-        Path b = tmp.resolve("b.txt");
-        Files.write(a, data1);
-        Files.write(b, data2);
+        assertNotEquals(hasher.partialHash(a), hasher.partialHash(b));
+        assertNotEquals(hasher.fullHash(a), hasher.fullHash(b));
+    }
 
-        RollingHasher.HashResult ra = hasher.hash(a);
-        RollingHasher.HashResult rb = hasher.hash(b);
+    /**
+     * The reason the two tiers exist: a shared prefix is enough to pass the cheap
+     * filter, so only the full hash can actually decide.
+     */
+    @Test
+    void sharedPrefixPassesPartialHashButFailsFullHash(@TempDir Path tmp) throws IOException {
+        byte[] prefix = filled(PARTIAL_BYTES, (byte) 7);
 
-        assertNotEquals(ra.sha256(), rb.sha256(), "SHA-256 must differ for different content");
+        byte[] a = new byte[PARTIAL_BYTES * 2];
+        byte[] b = new byte[PARTIAL_BYTES * 2];
+        System.arraycopy(prefix, 0, a, 0, PARTIAL_BYTES);
+        System.arraycopy(prefix, 0, b, 0, PARTIAL_BYTES);
+        a[PARTIAL_BYTES] = 1;   // differ only after the partial window
+        b[PARTIAL_BYTES] = 2;
+
+        Path fileA = write(tmp, "a.bin", a);
+        Path fileB = write(tmp, "b.bin", b);
+
+        assertEquals(hasher.partialHash(fileA), hasher.partialHash(fileB),
+                "identical first 4KB must produce the same partial hash");
+        assertNotEquals(hasher.fullHash(fileA), hasher.fullHash(fileB),
+                "differing tails must produce different SHA-256");
     }
 
     @Test
-    void multipleChunksForLargeFile(@TempDir Path tmp) throws IOException {
-        // Write 12KB of data → 3 chunks of 4KB
-        byte[] data = new byte[12 * 1024];
-        for (int i = 0; i < data.length; i++) data[i] = (byte) (i % 127);
-        Path file = tmp.resolve("large.bin");
-        Files.write(file, data);
+    void partialHashOnlyReadsUpToWindowSize(@TempDir Path tmp) throws IOException {
+        byte[] prefix = filled(PARTIAL_BYTES, (byte) 3);
 
-        RollingHasher.HashResult result = hasher.hash(file);
+        byte[] shortFile = prefix.clone();
+        byte[] longFile = new byte[PARTIAL_BYTES * 3];
+        System.arraycopy(prefix, 0, longFile, 0, PARTIAL_BYTES);
 
-        assertEquals(3, result.chunkHashes().size(), "12KB file should produce 3 chunks at 4KB window");
+        Path small = write(tmp, "small.bin", shortFile);
+        Path large = write(tmp, "large.bin", longFile);
+
+        assertEquals(hasher.partialHash(small), hasher.partialHash(large),
+                "partial hash must ignore everything past the window");
     }
 
     @Test
-    void emptyFileProducesEmptyChunkList(@TempDir Path tmp) throws IOException {
-        Path empty = tmp.resolve("empty.txt");
-        Files.write(empty, new byte[0]);
+    void fileShorterThanWindowIsHashedInFull(@TempDir Path tmp) throws IOException {
+        Path a = write(tmp, "a.txt", "short".getBytes());
+        Path b = write(tmp, "b.txt", "short".getBytes());
+        Path c = write(tmp, "c.txt", "other".getBytes());
 
-        RollingHasher.HashResult result = hasher.hash(empty);
+        assertEquals(hasher.partialHash(a), hasher.partialHash(b));
+        assertNotEquals(hasher.partialHash(a), hasher.partialHash(c));
+    }
 
-        assertTrue(result.chunkHashes().isEmpty(), "empty file should have no chunk hashes");
+    @Test
+    void emptyFileHashesWithoutError(@TempDir Path tmp) throws IOException {
+        Path empty = write(tmp, "empty.txt", new byte[0]);
+
+        assertEquals(0L, hasher.partialHash(empty));
+        // SHA-256 of the empty input
+        assertEquals("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                hasher.fullHash(empty));
+    }
+
+    private static Path write(Path dir, String name, byte[] content) throws IOException {
+        Path file = dir.resolve(name);
+        Files.write(file, content);
+        return file;
+    }
+
+    private static byte[] filled(int length, byte value) {
+        byte[] data = new byte[length];
+        java.util.Arrays.fill(data, value);
+        return data;
     }
 }

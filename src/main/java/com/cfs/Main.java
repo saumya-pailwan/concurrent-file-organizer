@@ -5,20 +5,16 @@ import com.cfs.config.Config;
 import com.cfs.hash.DuplicateRegistry;
 import com.cfs.hash.RollingHasher;
 import com.cfs.organizer.Organizer;
-import com.cfs.queue.BoundedWorkQueue;
-import com.cfs.traversal.BFSTraverser;
-import com.cfs.worker.WorkerPool;
+import com.cfs.pipeline.DuplicateFinder;
+import com.cfs.pipeline.ScanStats;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.logging.Logger;
 
 // Usage: java -jar cfs.jar <rootDirectory> [REPORT|MOVE|DELETE]
 public class Main {
 
-    private static final Logger LOG = Logger.getLogger(Main.class.getName());
-
-    public static void main(String[] args) throws Exception {
+    public static void main(String[] args) {
         if (args.length < 1) {
             System.err.println("Usage: cfs <rootDirectory> [REPORT|MOVE|DELETE]");
             System.exit(1);
@@ -47,37 +43,43 @@ public class Main {
 
         long startMs = System.currentTimeMillis();
 
-        // Wire up the pipeline
-        BoundedWorkQueue  workQueue = new BoundedWorkQueue(Config.QUEUE_CAPACITY);
-        LRUSegmentCache   cache     = new LRUSegmentCache(Config.NUM_CACHE_SEGMENTS, Config.CACHE_SEGMENT_SIZE);
-        DuplicateRegistry registry  = new DuplicateRegistry();
-        RollingHasher     hasher    = new RollingHasher(Config.HASH_WINDOW_SIZE);
+        LRUSegmentCache cache = new LRUSegmentCache(Config.NUM_CACHE_SEGMENTS, Config.CACHE_SEGMENT_SIZE);
+        DuplicateRegistry registry = new DuplicateRegistry();
+        RollingHasher hasher = new RollingHasher(Config.PARTIAL_HASH_BYTES);
 
-        // Start consumer workers before the producer so they are ready immediately
-        WorkerPool workerPool = new WorkerPool(
-                Config.NUM_WORKER_THREADS, workQueue, hasher, cache, registry);
+        DuplicateFinder finder = new DuplicateFinder(
+                Config.NUM_WORKER_THREADS, hasher, cache, registry);
+        ScanStats stats = finder.find(root);
 
-        // Start BFS traversal (producer) on a dedicated thread
-        Thread traverserThread = new Thread(
-                new BFSTraverser(root, workQueue, Config.NUM_WORKER_THREADS),
-                "cfs-bfs-traverser");
-        traverserThread.start();
+        double elapsedSec = (System.currentTimeMillis() - startMs) / 1000.0;
+        printStats(stats, elapsedSec);
 
-        // Wait for traversal to complete (traverser sends poison pills when done)
-        traverserThread.join();
+        if (stats.failedFiles() > 0 && policy != Organizer.Policy.REPORT) {
+            System.out.printf("WARNING: %d file(s) could not be read and were excluded from "
+                    + "duplicate detection. %s will not consider them.%n%n",
+                    stats.failedFiles(), policy);
+        }
 
-        // Wait for all workers to drain the queue and finish
-        workerPool.awaitTermination(Config.SHUTDOWN_TIMEOUT_SECONDS);
+        new Organizer(policy, Config.OUTPUT_DIR).run(registry.getDuplicates());
+    }
 
-        long elapsedMs = System.currentTimeMillis() - startMs;
-        System.out.printf("Scan complete: %d files indexed, %d unique hashes in %.2fs%n",
-                registry.totalFilesRegistered(),
-                registry.totalUniqueHashes(),
-                elapsedMs / 1000.0);
-        System.out.printf("Cache size:    %d entries%n%n", cache.totalSize());
+    // Each line shows how many files survived a tier, and what the tier saved.
+    private static void printStats(ScanStats stats, double elapsedSec) {
+        int skippedBySize = stats.totalFiles() - stats.emptyFilesSkipped() - stats.afterSizeFilter();
+        int eliminatedByPartial = stats.afterSizeFilter() - stats.afterPartialFilter();
 
-        // Apply organizer policy to the discovered duplicates
-        Organizer organizer = new Organizer(policy, Config.OUTPUT_DIR);
-        organizer.run(registry.getDuplicates());
+        System.out.printf("Files scanned:          %6d%n", stats.totalFiles());
+        if (stats.emptyFilesSkipped() > 0) {
+            System.out.printf("Empty files skipped:    %6d%n", stats.emptyFilesSkipped());
+        }
+        System.out.printf("Same-size candidates:   %6d   (%d skipped, never read)%n",
+                stats.afterSizeFilter(), skippedBySize);
+        System.out.printf("Same-prefix candidates: %6d   (%d eliminated after %d KB each)%n",
+                stats.afterPartialFilter(), eliminatedByPartial, Config.PARTIAL_HASH_BYTES / 1024);
+        System.out.printf("Confirmed duplicates:   %6d%n", stats.duplicateFiles());
+        if (stats.failedFiles() > 0) {
+            System.out.printf("Unreadable files:       %6d%n", stats.failedFiles());
+        }
+        System.out.printf("%nScan completed in %.2fs%n%n", elapsedSec);
     }
 }

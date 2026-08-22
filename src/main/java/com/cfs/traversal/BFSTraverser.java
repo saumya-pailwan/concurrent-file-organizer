@@ -1,31 +1,28 @@
 package com.cfs.traversal;
 
-import com.cfs.queue.BoundedWorkQueue;
-
 import java.io.IOException;
 import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Queue;
 import java.util.logging.Logger;
 
-// BFS directory traverser (producer). Sends FileTask per file; poison pills on completion.
-public class BFSTraverser implements Runnable {
+// Walks the directory tree breadth-first and returns every regular file it finds.
+// Runs to completion before hashing starts, because the size filter needs the whole list.
+public class BFSTraverser {
 
     private static final Logger LOG = Logger.getLogger(BFSTraverser.class.getName());
 
     private final Path root;
-    private final BoundedWorkQueue workQueue;
-    private final int numWorkers;
 
-    public BFSTraverser(Path root, BoundedWorkQueue workQueue, int numWorkers) {
+    public BFSTraverser(Path root) {
         this.root = root;
-        this.workQueue = workQueue;
-        this.numWorkers = numWorkers;
     }
 
-    @Override
-    public void run() {
+    public List<FileTask> traverse() {
+        List<FileTask> files = new ArrayList<>();
         Queue<Path> bfsQueue = new ArrayDeque<>();
         bfsQueue.add(root);
 
@@ -36,7 +33,7 @@ public class BFSTraverser implements Runnable {
                     if (Files.isDirectory(child, LinkOption.NOFOLLOW_LINKS)) {
                         bfsQueue.add(child);
                     } else if (Files.isRegularFile(child, LinkOption.NOFOLLOW_LINKS)) {
-                        enqueue(child);
+                        addFile(files, child);
                     }
                 }
             } catch (AccessDeniedException e) {
@@ -46,17 +43,14 @@ public class BFSTraverser implements Runnable {
             }
         }
 
-        // Send one poison pill per worker so every worker eventually exits
-        for (int i = 0; i < numWorkers; i++) {
-            workQueue.produce(FileTask.POISON_PILL);
-        }
+        return files;
     }
 
-    private void enqueue(Path file) {
+    private void addFile(List<FileTask> files, Path file) {
         try {
             BasicFileAttributes attrs = Files.readAttributes(
                     file, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-            workQueue.produce(new FileTask(file, attrs.size(), attrs.lastModifiedTime().toMillis()));
+            files.add(new FileTask(file, attrs.size(), attrs.lastModifiedTime().toMillis()));
         } catch (NoSuchFileException e) {
             // file vanished between directory listing and attribute read — skip silently
         } catch (IOException e) {

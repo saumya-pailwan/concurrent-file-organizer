@@ -1,29 +1,22 @@
 package com.cfs.worker;
 
-import com.cfs.cache.LRUSegmentCache;
-import com.cfs.hash.DuplicateRegistry;
-import com.cfs.hash.RollingHasher;
 import com.cfs.queue.BoundedWorkQueue;
 
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
 
-// Fixed thread pool of FileWorkers with named threads and crash logging.
+// Fixed thread pool of FileWorkers, all running the same action over one queue.
 public class WorkerPool {
 
     private static final Logger LOG = Logger.getLogger(WorkerPool.class.getName());
 
     private final ExecutorService executor;
-    private final int numWorkers;
+    private final AtomicInteger failureCount = new AtomicInteger();
 
-    public WorkerPool(int numWorkers,
-                      BoundedWorkQueue workQueue,
-                      RollingHasher hasher,
-                      LRUSegmentCache cache,
-                      DuplicateRegistry registry) {
-        this.numWorkers = numWorkers;
+    public WorkerPool(int numWorkers, BoundedWorkQueue workQueue, FileAction action) {
         this.executor = Executors.newFixedThreadPool(numWorkers, r -> {
             Thread t = new Thread(r);
             t.setName("cfs-worker-" + t.getId());
@@ -33,7 +26,7 @@ public class WorkerPool {
         });
 
         for (int i = 0; i < numWorkers; i++) {
-            executor.submit(new FileWorker(workQueue, hasher, cache, registry));
+            executor.execute(new FileWorker(workQueue, action, failureCount));
         }
     }
 
@@ -51,7 +44,8 @@ public class WorkerPool {
         }
     }
 
-    public int numWorkers() {
-        return numWorkers;
+    /** Files whose action failed. Only meaningful once awaitTermination has returned. */
+    public int failureCount() {
+        return failureCount.get();
     }
 }

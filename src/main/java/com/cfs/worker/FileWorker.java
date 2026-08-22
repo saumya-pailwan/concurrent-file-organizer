@@ -1,36 +1,27 @@
 package com.cfs.worker;
 
-import com.cfs.cache.FileMeta;
-import com.cfs.cache.LRUSegmentCache;
-import com.cfs.hash.DuplicateRegistry;
-import com.cfs.hash.FileEntry;
-import com.cfs.hash.RollingHasher;
-import com.cfs.hash.RollingHasher.HashResult;
 import com.cfs.queue.BoundedWorkQueue;
 import com.cfs.traversal.FileTask;
 
 import java.io.IOException;
 import java.nio.file.NoSuchFileException;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
 
-// Consumer thread: dequeues FileTasks, hashes each file, registers results in DuplicateRegistry.
+// Consumer thread: pulls files from the queue one at a time and applies the given action.
+// A file whose action fails is counted, since it drops out of the results entirely.
 public class FileWorker implements Runnable {
 
     private static final Logger LOG = Logger.getLogger(FileWorker.class.getName());
 
     private final BoundedWorkQueue workQueue;
-    private final RollingHasher hasher;
-    private final LRUSegmentCache cache;
-    private final DuplicateRegistry registry;
+    private final FileAction action;
+    private final AtomicInteger failureCount;
 
-    public FileWorker(BoundedWorkQueue workQueue,
-                      RollingHasher hasher,
-                      LRUSegmentCache cache,
-                      DuplicateRegistry registry) {
+    public FileWorker(BoundedWorkQueue workQueue, FileAction action, AtomicInteger failureCount) {
         this.workQueue = workQueue;
-        this.hasher = hasher;
-        this.cache = cache;
-        this.registry = registry;
+        this.action = action;
+        this.failureCount = failureCount;
     }
 
     @Override
@@ -45,34 +36,14 @@ public class FileWorker implements Runnable {
     }
 
     private void process(FileTask task) {
-        // Populate the metadata cache if not already present
-        FileMeta meta = cache.get(task.path());
-        if (meta == null) {
-            String ext = extensionOf(task.path().getFileName().toString());
-            meta = new FileMeta(task.path(), task.sizeBytes(), task.lastModifiedMs(), ext);
-            cache.put(task.path(), meta);
-        }
-
         try {
-            HashResult result = hasher.hash(task.path());
-            if (result.chunkHashes().isEmpty()) {
-                // empty file — skip
-                return;
-            }
-            FileEntry entry = new FileEntry(
-                    task.path(), task.sizeBytes(), result.chunkHashes(), result.sha256());
-            registry.register(entry);
+            action.apply(task);
         } catch (NoSuchFileException e) {
-            // file was deleted after it was enqueued — harmless, skip silently
+            // file was deleted after traversal listed it
+            failureCount.incrementAndGet();
         } catch (IOException e) {
-            LOG.warning("Failed to hash " + task.path() + ": " + e.getMessage());
+            LOG.warning("Failed to read " + task.path() + ": " + e.getMessage());
+            failureCount.incrementAndGet();
         }
-    }
-
-    private String extensionOf(String filename) {
-        int dot = filename.lastIndexOf('.');
-        return (dot >= 0 && dot < filename.length() - 1)
-                ? filename.substring(dot + 1).toLowerCase()
-                : "";
     }
 }
